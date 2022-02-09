@@ -1,6 +1,6 @@
 use crate::error::SamplingError;
 use crate::kernel_error::{self, IntoResult, KernelError};
-use crate::proc_maps::{get_backtrace, ForeignMemory};
+use crate::proc_maps::{get_backtrace, ForeignMemory, VmSubData};
 use crate::thread_act::thread_info;
 use crate::thread_info::time_value;
 use crate::thread_info::{
@@ -51,8 +51,10 @@ impl ThreadProfiler {
         })
     }
 
-    pub fn sample(&mut self, now: Instant) -> Result<bool, SamplingError> {
-        let result = self.sample_impl(now);
+    pub fn sample(&mut self, 
+        stackwalker: &framehop::UnwinderNative<VmSubData>,
+        stackwalker_cache: &mut framehop::CacheNative<VmSubData>, now: Instant) -> Result<bool, SamplingError> {
+        let result = self.sample_impl(stackwalker, stackwalker_cache, now);
         match result {
             Ok(()) => Ok(true),
             Err(SamplingError::ThreadTerminated(_, _)) => Ok(false),
@@ -75,7 +77,9 @@ impl ThreadProfiler {
         }
     }
 
-    fn sample_impl(&mut self, now: Instant) -> Result<(), SamplingError> {
+    fn sample_impl(&mut self, 
+        stackwalker: &framehop::UnwinderNative<VmSubData>,
+        stackwalker_cache: &mut framehop::CacheNative<VmSubData>, now: Instant) -> Result<(), SamplingError> {
         self.tick_count += 1;
 
         if self.name.is_none() && self.tick_count % 10 == 1 {
@@ -92,6 +96,8 @@ impl ThreadProfiler {
         if !cpu_delta.is_zero() || self.previous_stack.is_none() {
             self.stack_scratch_space.clear();
             get_backtrace(
+                stackwalker,
+                stackwalker_cache,
                 &mut self.stack_memory,
                 self.thread_act,
                 &mut self.stack_scratch_space,

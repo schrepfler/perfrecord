@@ -1,6 +1,6 @@
 use crate::error::SamplingError;
 use crate::kernel_error::{IntoResult, KernelError};
-use crate::proc_maps::{DyldInfo, DyldInfoManager, Modification};
+use crate::proc_maps::{DyldInfo, DyldInfoManager, Modification, VmSubData};
 use crate::thread_profiler::ThreadProfiler;
 use gecko_profile::debugid::DebugId;
 use mach::mach_types::thread_act_port_array_t;
@@ -15,6 +15,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gecko_profile::ProfileBuilder;
@@ -33,6 +34,8 @@ pub struct TaskProfiler {
     executable_lib: Option<DyldInfo>,
     command_name: String,
     ignored_errors: Vec<SamplingError>,
+    stackwalker: framehop::UnwinderNative<VmSubData>,
+    stackwalker_cache: framehop::CacheNative<VmSubData>,
 }
 
 impl TaskProfiler {
@@ -67,6 +70,8 @@ impl TaskProfiler {
             command_name: command_name.to_owned(),
             executable_lib: None,
             ignored_errors: Vec::new(),
+            stackwalker: framehop::UnwinderNative::new(),
+            stackwalker_cache: framehop::CacheNative::new(),
         })
     }
 
@@ -105,6 +110,7 @@ impl TaskProfiler {
                     if self.executable_lib.is_none() && lib.is_executable {
                         self.executable_lib = Some(lib.clone());
                     }
+                    self.add_lib_to_stackwalker(&lib);
                     self.libs.push(lib)
                 }
                 Modification::Removed(_) => {
@@ -134,7 +140,7 @@ impl TaskProfiler {
                 }
             };
             // Grab a sample from the thread.
-            let still_alive = thread.sample(now)?;
+            let still_alive = thread.sample(&self.stackwalker, &mut self.stackwalker_cache, now)?;
             if still_alive {
                 now_live_threads.insert(thread_act);
             }
@@ -146,6 +152,41 @@ impl TaskProfiler {
             self.dead_threads.push(thread);
         }
         Ok(())
+    }
+
+    fn add_lib_to_stackwalker(&mut self, lib: &DyldInfo) {
+        let unwind_info_data = lib
+            .unwind_sections
+            .unwind_info_section
+            .and_then(|(addr, size)| VmSubData::map_from_task(self.task, addr, size).ok());
+        let eh_frame_data = lib
+            .unwind_sections
+            .eh_frame_section
+            .and_then(|(addr, size)| VmSubData::map_from_task(self.task, addr, size).ok());
+
+        let unwind_data = match (unwind_info_data, eh_frame_data) {
+            (Some(unwind_info), Some(eh_frame)) => {
+                framehop::UnwindData::CompactUnwindInfoAndEhFrame(
+                    unwind_info,
+                    Some(Arc::new(eh_frame)),
+                )
+            }
+            (Some(unwind_info), None) => {
+                framehop::UnwindData::CompactUnwindInfoAndEhFrame(unwind_info, None)
+            }
+            (None, Some(eh_frame)) => framehop::UnwindData::EhFrame(Arc::new(eh_frame)),
+            (None, None) => framehop::UnwindData::None,
+        };
+
+        let module = framehop::Module::new(
+            lib.file.clone(),
+            lib.address..(lib.address + lib.vmsize),
+            lib.address,
+            lib.vm_addr_at_base_addr,
+            lib.sections.clone(),
+            unwind_data,
+        );
+        self.stackwalker.add_module(module);
     }
 
     pub fn notify_dead(&mut self, end_time: Instant) {

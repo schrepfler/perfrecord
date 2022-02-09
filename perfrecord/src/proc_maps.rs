@@ -13,13 +13,20 @@ use mach::vm_prot::{vm_prot_t, VM_PROT_NONE, VM_PROT_READ};
 use mach::vm_types::{mach_vm_address_t, mach_vm_size_t};
 use std::cmp::Ordering;
 use std::mem;
+use std::ops::Deref;
 use std::ptr;
 use uuid::Uuid;
+
+use framehop::{strip_ptr_auth, UnwindRegsNative};
+#[cfg(target_arch = "aarch64")]
+use framehop::UnwindRegsAarch64;
+#[cfg(target_arch = "x86_64")]
+use framehop::UnwindRegsX86_64;
 
 #[cfg(target_arch = "x86_64")]
 use mach::{structs::x86_thread_state64_t, thread_status::x86_THREAD_STATE64};
 
-use crate::dyld_bindings;
+use crate::dyld_bindings::{self, section_64};
 use crate::error::SamplingError;
 use crate::kernel_error::{self, IntoResult, KernelError};
 use dyld_bindings::{
@@ -42,8 +49,19 @@ pub struct DyldInfo {
     pub file: String,
     pub address: u64,
     pub vmsize: u64,
+    pub vm_addr_at_base_addr: u64,
+    pub sections: framehop::SectionAddresses,
     pub uuid: Option<Uuid>,
     pub arch: Option<&'static str>,
+    pub unwind_sections: UnwindSectionInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwindSectionInfo {
+    /// (address, size)
+    pub unwind_info_section: Option<(u64, u64)>,
+    /// (address, size)
+    pub eh_frame_section: Option<(u64, u64)>,
 }
 
 pub struct DyldInfoManager {
@@ -256,8 +274,13 @@ fn get_dyld_image_info(
     let commands_buffer = memory.get_slice(commands_range)?;
 
     // Figure out the slide from the __TEXT segment if appropiate
+    let mut textvmaddr: u64 = 0;
     let mut vmsize: u64 = 0;
     let mut uuid = None;
+    let mut unwind_info_section = None;
+    let mut eh_frame_section = None;
+    let mut text_section_addr = 0;
+    let mut got_section_addr = 0;
     let mut offset = 0;
     for _ in 0..header.ncmds {
         unsafe {
@@ -269,6 +292,40 @@ fn get_dyld_image_info(
                     if (*segcmd).segname[0..7] == [95, 95, 84, 69, 88, 84, 0] {
                         // This is the __TEXT segment.
                         vmsize = (*segcmd).vmsize;
+                        textvmaddr = (*segcmd).vmaddr;
+
+                        let mut section_offset = offset + mem::size_of::<segment_command_64>();
+                        let nsects = (*segcmd).nsects;
+                        for _ in 0..nsects {
+                            let section =
+                                &commands_buffer[section_offset] as *const u8 as *const section_64;
+                            // section.addr is a vmaddr. make it relative to the __TEXT segment by subtracting
+                            // the segment's vmaddr. The __TEXT segment always starts at the image load address.
+                            // So adding the image load address to the relative address gives us the absolute
+                            // address of the section in process memory.
+                            let addr = image_load_address + ((*section).addr - textvmaddr);
+                            let size = (*section).size;
+                            if (*section).sectname[0..7] == [95, 95, 116, 101, 120, 116, 0] {
+                                // This is the __text section.
+                                text_section_addr = addr;
+                            } else if (*section).sectname[0..6] == [95, 95, 103, 111, 116, 0] {
+                                // This is the __got section.
+                                got_section_addr = addr;
+                            } else if (*section).sectname[0..14]
+                                == [
+                                    95, 95, 117, 110, 119, 105, 110, 100, 95, 105, 110, 102, 111, 0,
+                                ]
+                            {
+                                // This is the __unwind_info section.
+                                unwind_info_section = Some((addr, size));
+                            } else if (*section).sectname[0..11]
+                                == [95, 95, 101, 104, 95, 102, 114, 97, 109, 101, 0]
+                            {
+                                // This is the __eh_frame section.
+                                eh_frame_section = Some((addr, size));
+                            }
+                            section_offset += mem::size_of::<section_64>();
+                        }
                     }
                 }
                 0x1b => {
@@ -281,13 +338,25 @@ fn get_dyld_image_info(
             offset += (*command).cmdsize as usize;
         }
     }
+
     Ok(DyldInfo {
         file: filename,
         address: image_load_address,
         vmsize,
+        vm_addr_at_base_addr: textvmaddr,
+        sections: framehop::SectionAddresses {
+            text: text_section_addr,
+            eh_frame: eh_frame_section.map(|(addr, _)| addr).unwrap_or(0),
+            eh_frame_hdr: 0,
+            got: got_section_addr,
+        },
         uuid,
         arch: get_arch_string(header.cputype as u32, header.cpusubtype as u32),
         is_executable: header.filetype == MH_EXECUTE,
+        unwind_sections: UnwindSectionInfo {
+            unwind_info_section,
+            eh_frame_section,
+        },
     })
 }
 
@@ -322,7 +391,9 @@ impl arm_thread_state64_t {
 pub static ARM_THREAD_STATE64: thread_state_flavor_t = 6;
 
 #[cfg(target_arch = "x86_64")]
-fn get_unwinding_registers(thread_act: mach_port_t) -> kernel_error::Result<(u64, u64)> {
+fn get_unwinding_registers(
+    thread_act: mach_port_t,
+) -> kernel_error::Result<(u64, UnwindRegsX86_64)> {
     let mut state: x86_thread_state64_t = unsafe { mem::zeroed() };
     let mut count = x86_thread_state64_t::count();
     unsafe {
@@ -334,11 +405,13 @@ fn get_unwinding_registers(thread_act: mach_port_t) -> kernel_error::Result<(u64
         )
     }
     .into_result()?;
-    Ok((state.__rip, state.__rbp))
+    Ok((state.__rip, UnwindRegsX86_64::new(state.__rsp, state.__rbp)))
 }
 
 #[cfg(target_arch = "aarch64")]
-fn get_unwinding_registers(thread_act: mach_port_t) -> kernel_error::Result<(u64, u64)> {
+fn get_unwinding_registers(
+    thread_act: mach_port_t,
+) -> kernel_error::Result<(u64, UnwindRegsAarch64)> {
     let mut state: arm_thread_state64_t = unsafe { mem::zeroed() };
     let mut count = arm_thread_state64_t::count();
     unsafe {
@@ -350,7 +423,10 @@ fn get_unwinding_registers(thread_act: mach_port_t) -> kernel_error::Result<(u64
         )
     }
     .into_result()?;
-    Ok((state.__pc, state.__fp))
+    Ok((
+        strip_ptr_auth(state.__pc),
+        UnwindRegsAarch64::new(state.__lr, state.__sp, state.__fp),
+    ))
 }
 
 fn with_suspended_thread<R>(
@@ -364,12 +440,14 @@ fn with_suspended_thread<R>(
 }
 
 pub fn get_backtrace(
+    stackwalker: &framehop::UnwinderNative<VmSubData>,
+    stackwalker_cache: &mut framehop::CacheNative<VmSubData>,
     memory: &mut ForeignMemory,
     thread_act: mach_port_t,
     frames: &mut Vec<u64>,
 ) -> Result<(), SamplingError> {
     with_suspended_thread(thread_act, || {
-        let (ip, bp) = get_unwinding_registers(thread_act).map_err(|err| match err {
+        let (pc, regs) = get_unwinding_registers(thread_act).map_err(|err| match err {
             KernelError::InvalidArgument
             | KernelError::MachSendInvalidDest
             | KernelError::Terminated => {
@@ -377,7 +455,7 @@ pub fn get_backtrace(
             }
             err => SamplingError::Ignorable("thread_get_state in get_unwinding_registers", err),
         })?;
-        do_frame_pointer_stackwalk(ip, bp, memory, frames);
+        do_stackwalk(stackwalker, stackwalker_cache, pc, regs, memory, frames);
         Ok(())
     })
     .unwrap_or_else(|err| match err {
@@ -394,81 +472,50 @@ pub fn get_backtrace(
     })
 }
 
-#[cfg(target_arch = "aarch64")]
-/// On macOS arm64, system libraries are arm64e binaries, and arm64e can do pointer authentication:
-/// The low bits of the pointer are the actual pointer value, and the high bits are an encrypted hash.
-/// During stackwalking, we need to strip off this hash.
-/// I don't know of an easy way to get the correct mask dynamically - all the potential functions
-/// I've seen for this are no-ops when called from regular arm64 code.
-/// So for now, we hardcode a mask that seems to work today, and worry about it if it stops working.
-/// 24 bits hash + 40 bits pointer
-const PTR_MASK: u64 = (1 << 40) - 1;
+fn do_stackwalk(
+    stackwalker: &framehop::UnwinderNative<VmSubData>,
+    stackwalker_cache: &mut framehop::CacheNative<VmSubData>,
+    pc: u64,
+    mut regs: UnwindRegsNative,
+    memory: &mut ForeignMemory,
+    frames: &mut Vec<u64>,
+) {
+    frames.push(pc);
 
-#[cfg(not(target_arch = "aarch64"))]
-const PTR_MASK: u64 = !1;
+    let mut read_stack = |addr| memory.read_u64_at_address(addr).map_err(|_| ());
 
-fn do_frame_pointer_stackwalk(ip: u64, bp: u64, memory: &mut ForeignMemory, frames: &mut Vec<u64>) {
-    frames.push(ip & PTR_MASK);
+    // println!("begin unwinding for pc 0x{:x} with regs {:?}", pc, regs);
 
-    // Do a frame pointer stack walk. Code that is compiled with frame pointers
-    // has the following function prologues and epilogues:
-    //
-    // Function prologue:
-    // pushq  %rbp
-    // movq   %rsp, %rbp
-    //
-    // Function epilogue:
-    // popq   %rbp
-    // ret
-    //
-    // Functions are called with callq; callq pushes the return address onto the stack.
-    // When a function reaches its end, ret pops the return address from the stack and jumps to it.
-    // So when a function is called, we have the following stack layout:
-    //
-    //                                                                     [... rest of the stack]
-    //                                                                     ^ rsp           ^ rbp
-    //     callq some_function
-    //                                                   [return address]  [... rest of the stack]
-    //                                                   ^ rsp                             ^ rbp
-    //     pushq %rbp
-    //                         [caller's frame pointer]  [return address]  [... rest of the stack]
-    //                         ^ rsp                                                       ^ rbp
-    //     movq %rsp, %rbp
-    //                         [caller's frame pointer]  [return address]  [... rest of the stack]
-    //                         ^ rsp, rbp
-    //     <other instructions>
-    //       [... more stack]  [caller's frame pointer]  [return address]  [... rest of the stack]
-    //       ^ rsp             ^ rbp
-    //
-    // So: *rbp is the caller's frame pointer, and *(rbp + 8) is the return address.
-    //
-    // Or, in other words, the following linked list is built up on the stack:
-    // #[repr(C)]
-    // struct CallFrameInfo {
-    //     previous: *const CallFrameInfo,
-    //     return_address: *const c_void,
-    // }
-    // and rbp is a *const CallFrameInfo.
-
-    let mut frame_ptr = bp & PTR_MASK;
-    while frame_ptr != 0 && (frame_ptr & 7) == 0 {
-        let caller_frame_ptr = match memory.read_u64_at_address(frame_ptr) {
-            Ok(val) => val & PTR_MASK,
-            Err(_) => break, // usually KernelError::InvalidAddress
+    let mut return_address =
+        match stackwalker.unwind_first(pc, &mut regs, stackwalker_cache, &mut read_stack) {
+            Err(_) => return,
+            Ok(ra) => strip_ptr_auth(ra),
         };
-        // The stack grows towards lower addresses, so the caller frame will always
-        // be at a higher address than this frame. Make sure this is the case, so
-        // that we don't go in circles.
-        if caller_frame_ptr <= frame_ptr {
-            break;
-        }
-        let return_address = match memory.read_u64_at_address(frame_ptr + 8) {
-            Ok(val) => val & PTR_MASK,
-            Err(_) => break, // usually KernelError::InvalidAddress
+    frames.push(return_address);
+
+    for _ in 0..2000 {
+        return_address = match stackwalker.unwind_next(
+            return_address,
+            &mut regs,
+            stackwalker_cache,
+            &mut read_stack,
+        ) {
+            Err(_) => break,
+            Ok(ra) => strip_ptr_auth(ra),
         };
+
         frames.push(return_address);
-        frame_ptr = caller_frame_ptr;
     }
+
+    // eprintln!(
+    //     "stack: [{}]",
+    //     frames
+    //         .iter()
+    //         .map(|addr| format!("0x{:x}", addr))
+    //         .collect::<Vec<String>>()
+    //         .join(", ")
+    // );
+    // eprintln!();
 
     frames.reverse();
 }
@@ -545,8 +592,43 @@ impl ForeignMemory {
     }
 }
 
+pub struct VmSubData {
+    page_aligned_data: VmData,
+    address_range: std::ops::Range<u64>,
+}
+
+impl VmSubData {
+    /// address and size can be unaligned
+    pub fn map_from_task(task: mach_port_t, address: u64, size: u64) -> kernel_error::Result<Self> {
+        let last_byte = address + size - 1;
+        let aligned_start_addr = unsafe { mach_vm_trunc_page(address) };
+        let aligned_end_addr = unsafe { mach_vm_trunc_page(last_byte) + vm_page_size as u64 };
+
+        Ok(Self {
+            page_aligned_data: VmData::map_from_task(
+                task,
+                aligned_start_addr,
+                aligned_end_addr - aligned_start_addr,
+            )?,
+            address_range: address..(address + size),
+        })
+    }
+
+    pub fn get_full_slice(&self) -> &[u8] {
+        self.page_aligned_data.get_slice(self.address_range.clone())
+    }
+}
+
+impl Deref for VmSubData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.get_full_slice()
+    }
+}
+
 #[derive(Debug, Clone)]
-struct VmData {
+pub struct VmData {
     address_range: std::ops::Range<u64>,
     data: *mut u8,
     data_size: usize,
@@ -579,11 +661,20 @@ impl VmData {
         })
     }
 
+    /// original_address and size must be aligned to the page size.
     pub fn map_from_task(
         task: mach_port_t,
         original_address: u64,
         size: u64,
     ) -> kernel_error::Result<Self> {
+        let aligned_addr = unsafe { mach_vm_trunc_page(original_address) };
+        if aligned_addr != original_address {
+            return Err(KernelError::InvalidAddress); // TODO: custom "unaligned address" error
+        }
+        if size % (unsafe { vm_page_size } as u64) != 0 {
+            return Err(KernelError::InvalidValue); // TODO: custom "unaligned size" error
+        }
+
         let mut data: *mut u8 = ptr::null_mut();
         let mut cur_protection: vm_prot_t = VM_PROT_NONE;
         let mut max_protection: vm_prot_t = VM_PROT_NONE;
@@ -625,12 +716,27 @@ impl VmData {
         unsafe { std::slice::from_raw_parts(self.data.offset(offset as isize), len as usize) }
     }
 
+    pub fn get_full_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data, self.data_size) }
+    }
+
     pub unsafe fn get_type_ref<T>(&self, address: u64) -> &T {
         assert!(address % mem::align_of::<T>() as u64 == 0);
         let range = address..(address + mem::size_of::<T>() as u64);
         let slice = self.get_slice(range);
         assert!(slice.len() == mem::size_of::<T>());
         &*(slice.as_ptr() as *const T)
+    }
+}
+
+// Safety: Not sure actually.
+unsafe impl Sync for VmData {}
+
+impl Deref for VmData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.get_full_slice()
     }
 }
 
